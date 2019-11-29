@@ -14,9 +14,11 @@ build:
   - mkdir -p .cache
   - export GOPATH="$CI_PROJECT_DIR/.cache"
   script:
+  - CGO_ENABLED=0 go build -o mautrix-whatsapp-static
   - go build -o mautrix-whatsapp
   artifacts:
     paths:
+    - mautrix-whatsapp-static
     - mautrix-whatsapp
     - example-config.yaml
 

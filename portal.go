@@ -34,7 +34,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/chai2010/webp"
+	"golang.org/x/image/webp"
 	log "maunium.net/go/maulogger/v2"
 
 	"github.com/Rhymen/go-whatsapp"
