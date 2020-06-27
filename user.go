@@ -58,7 +58,8 @@ type User struct {
 	ConnectionErrors int
 	CommunityID      string
 
-	cleanDisconnection bool
+	cleanDisconnection  bool
+	batteryWarningsSent int
 
 	chatListReceived chan struct{}
 	syncPortalsDone  chan struct{}
@@ -235,7 +236,7 @@ func (user *User) Connect(evenIfNoSession bool) bool {
 		return false
 	}
 	user.Conn = whatsappExt.ExtendConn(conn)
-	_ = user.Conn.SetClientName("Mautrix-WhatsApp bridge", "mx-wa", WAVersion)
+	_ = user.Conn.SetClientName(user.bridge.Config.WhatsApp.DeviceName, user.bridge.Config.WhatsApp.ShortName, WAVersion)
 	user.log.Debugln("WhatsApp connection successful")
 	user.Conn.AddHandler(user)
 	return user.RestoreSession()
@@ -561,6 +562,7 @@ func (user *User) HandleError(err error) {
 		user.log.Errorfln("WhatsApp error: %v", err)
 	}
 	if closed, ok := err.(*whatsapp.ErrConnectionClosed); ok {
+		user.bridge.Metrics.TrackDisconnection(user.MXID)
 		if closed.Code == 1000 && user.cleanDisconnection {
 			user.cleanDisconnection = false
 			user.log.Infoln("Clean disconnection by server")
@@ -568,6 +570,7 @@ func (user *User) HandleError(err error) {
 		}
 		go user.tryReconnect(fmt.Sprintf("Your WhatsApp connection was closed with websocket status code %d", closed.Code))
 	} else if failed, ok := err.(*whatsapp.ErrConnectionFailed); ok {
+		user.bridge.Metrics.TrackDisconnection(user.MXID)
 		user.ConnectionErrors++
 		go user.tryReconnect(fmt.Sprintf("Your WhatsApp connection failed: %v", failed.Err))
 	}
@@ -667,6 +670,33 @@ func (user *User) putMessage(message PortalMessage) {
 	case user.messages <- message:
 	default:
 		user.log.Warnln("Buffer is full, dropping message in", message.chat)
+	}
+}
+
+func (user *User) HandleNewContact(contact whatsapp.Contact) {
+	user.log.Debugfln("Contact message: %+v", contact)
+	go func() {
+		puppet := user.bridge.GetPuppetByJID(contact.Jid)
+		puppet.UpdateName(user, contact)
+	}()
+}
+
+func (user *User) HandleBatteryMessage(battery whatsapp.BatteryMessage) {
+	user.log.Debugfln("Battery message: %+v", battery)
+	var notice string
+	if !battery.Plugged && battery.Percentage < 15 && user.batteryWarningsSent < 1 {
+		notice = fmt.Sprintf("Phone battery low (%d remaining)", battery.Percentage)
+		user.batteryWarningsSent = 1
+	} else if !battery.Plugged && battery.Percentage < 5 && user.batteryWarningsSent < 1 {
+		notice = fmt.Sprintf("Phone battery very low (%d remaining)", battery.Percentage)
+		user.batteryWarningsSent = 2
+	} else {
+		user.batteryWarningsSent = 0
+	}
+	if notice != "" {
+		go func() {
+			_, _ = user.bridge.Bot.SendNotice(user.GetManagementRoom(), notice)
+		}()
 	}
 }
 
@@ -831,6 +861,14 @@ func (user *User) HandleChatUpdate(cmd whatsappExt.ChatUpdate) {
 
 	portal := user.GetPortalByJID(cmd.JID)
 	if len(portal.MXID) == 0 {
+		if cmd.Data.Action == whatsappExt.ChatActionIntroduce || cmd.Data.Action == whatsappExt.ChatActionCreate {
+			go func() {
+				err := portal.CreateMatrixRoom(user)
+				if err != nil {
+					user.log.Errorln("Failed to create portal room after receiving join event:", err)
+				}
+			}()
+		}
 		return
 	}
 
@@ -842,13 +880,21 @@ func (user *User) HandleChatUpdate(cmd whatsappExt.ChatUpdate) {
 	case whatsappExt.ChatActionRemoveTopic:
 		go portal.UpdateTopic("", cmd.Data.SenderJID, true)
 	case whatsappExt.ChatActionPromote:
-		go portal.ChangeAdminStatus(cmd.Data.PermissionChange.JIDs, true)
+		go portal.ChangeAdminStatus(cmd.Data.UserChange.JIDs, true)
 	case whatsappExt.ChatActionDemote:
-		go portal.ChangeAdminStatus(cmd.Data.PermissionChange.JIDs, false)
+		go portal.ChangeAdminStatus(cmd.Data.UserChange.JIDs, false)
 	case whatsappExt.ChatActionAnnounce:
 		go portal.RestrictMessageSending(cmd.Data.Announce)
 	case whatsappExt.ChatActionRestrict:
 		go portal.RestrictMetadataChanges(cmd.Data.Restrict)
+	case whatsappExt.ChatActionRemove:
+		go portal.HandleWhatsAppKick(cmd.Data.SenderJID, cmd.Data.UserChange.JIDs)
+	case whatsappExt.ChatActionAdd:
+		go portal.HandleWhatsAppInvite(cmd.Data.SenderJID, cmd.Data.UserChange.JIDs)
+	case whatsappExt.ChatActionIntroduce:
+		if cmd.Data.SenderJID != "unknown" {
+			go portal.Sync(user, whatsapp.Contact{Jid: portal.Key.JID})
+		}
 	}
 }
 

@@ -77,9 +77,8 @@ func (helper *CryptoHelper) Init() error {
 	helper.log.Debugln("Logged in as bridge bot with device ID", helper.client.DeviceID)
 	logger := &cryptoLogger{helper.baseLog}
 	stateStore := &cryptoStateStore{helper.bridge}
-	helper.store = database.NewSQLCryptoStore(helper.bridge.DB, helper.client.DeviceID)
-	helper.store.UserID = helper.client.UserID
-	helper.store.GhostIDFormat = fmt.Sprintf("@%s:%s", helper.bridge.Config.Bridge.FormatUsername("%"), helper.bridge.AS.HomeserverDomain)
+	helper.store = database.NewSQLCryptoStore(helper.bridge.DB, helper.client.DeviceID, helper.client.UserID,
+		fmt.Sprintf("@%s:%s", helper.bridge.Config.Bridge.FormatUsername("%"), helper.bridge.AS.HomeserverDomain))
 	helper.mach = crypto.NewOlmMachine(helper.client, logger, helper.store, stateStore)
 
 	helper.client.Logger = logger.int.Sub("Bot")
@@ -131,7 +130,7 @@ func (helper *CryptoHelper) Decrypt(evt *event.Event) (*event.Event, error) {
 }
 
 func (helper *CryptoHelper) Encrypt(roomID id.RoomID, evtType event.Type, content event.Content) (*event.EncryptedEventContent, error) {
-	encrypted, err := helper.mach.EncryptMegolmEvent(roomID, evtType, content)
+	encrypted, err := helper.mach.EncryptMegolmEvent(roomID, evtType, &content)
 	if err != nil {
 		if err != crypto.SessionExpired && err != crypto.SessionNotShared && err != crypto.NoGroupSession {
 			return nil, err
@@ -145,7 +144,7 @@ func (helper *CryptoHelper) Encrypt(roomID id.RoomID, evtType event.Type, conten
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to share group session")
 		}
-		encrypted, err = helper.mach.EncryptMegolmEvent(roomID, evtType, content)
+		encrypted, err = helper.mach.EncryptMegolmEvent(roomID, evtType, &content)
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to encrypt event after re-sharing group session")
 		}

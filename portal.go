@@ -26,10 +26,14 @@ import (
 	"image/gif"
 	"image/jpeg"
 	"image/png"
+	"io/ioutil"
 	"math"
 	"math/rand"
 	"mime"
 	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -199,15 +203,34 @@ func (portal *Portal) handleMessage(msg PortalMessage) {
 	case whatsapp.TextMessage:
 		portal.HandleTextMessage(msg.source, data)
 	case whatsapp.ImageMessage:
-		portal.HandleMediaMessage(msg.source, data.Download, data.Thumbnail, data.Info, data.ContextInfo, data.Type, data.Caption, 0, false)
+		portal.HandleMediaMessage(msg.source, mediaMessage{
+			base:      base{data.Download, data.Info, data.ContextInfo, data.Type},
+			thumbnail: data.Thumbnail,
+			caption:   data.Caption,
+		})
 	case whatsapp.StickerMessage:
-		portal.HandleMediaMessage(msg.source, data.Download, nil, data.Info, data.ContextInfo, data.Type, "", 0, true)
+		portal.HandleMediaMessage(msg.source, mediaMessage{
+			base:          base{data.Download, data.Info, data.ContextInfo, data.Type},
+			sendAsSticker: true,
+		})
 	case whatsapp.VideoMessage:
-		portal.HandleMediaMessage(msg.source, data.Download, data.Thumbnail, data.Info, data.ContextInfo, data.Type, data.Caption, data.Length, false)
+		portal.HandleMediaMessage(msg.source, mediaMessage{
+			base:      base{data.Download, data.Info, data.ContextInfo, data.Type},
+			thumbnail: data.Thumbnail,
+			caption:   data.Caption,
+			length:    data.Length,
+		})
 	case whatsapp.AudioMessage:
-		portal.HandleMediaMessage(msg.source, data.Download, nil, data.Info, data.ContextInfo, data.Type, "", data.Length, false)
+		portal.HandleMediaMessage(msg.source, mediaMessage{
+			base:   base{data.Download, data.Info, data.ContextInfo, data.Type},
+			length: data.Length,
+		})
 	case whatsapp.DocumentMessage:
-		portal.HandleMediaMessage(msg.source, data.Download, data.Thumbnail, data.Info, data.ContextInfo, data.Type, data.Title, 0, false)
+		portal.HandleMediaMessage(msg.source, mediaMessage{
+			base:      base{data.Download, data.Info, data.ContextInfo, data.Type},
+			thumbnail: data.Thumbnail,
+			fileName:  data.Title,
+		})
 	case whatsapp.ContactMessage:
 		portal.HandleContactMessage(msg.source, data)
 	case whatsapp.LocationMessage:
@@ -526,7 +549,7 @@ func (portal *Portal) Sync(user *User, contact whatsapp.Contact) {
 func (portal *Portal) GetBasePowerLevels() *event.PowerLevelsEventContent {
 	anyone := 0
 	nope := 99
-	invite := 99
+	invite := 50
 	if portal.bridge.Config.Bridge.AllowUserInvite {
 		invite = 0
 	}
@@ -782,6 +805,12 @@ func (portal *Portal) handleHistory(user *User, messages []interface{}) {
 		}
 		data := whatsapp.ParseProtoMessage(message)
 		if data == nil {
+			st := message.GetMessageStubType()
+			// Ignore some types that are known to fail
+			if st == waProto.WebMessageInfo_CALL_MISSED_VOICE || st == waProto.WebMessageInfo_CALL_MISSED_VIDEO ||
+				st == waProto.WebMessageInfo_CALL_MISSED_GROUP_VOICE || st == waProto.WebMessageInfo_CALL_MISSED_GROUP_VIDEO {
+				continue
+			}
 			portal.log.Warnln("Message", message.GetKey().GetId(), "failed to parse during backfilling")
 			continue
 		}
@@ -1250,35 +1279,117 @@ func (portal *Portal) encryptFile(data []byte, mimeType string) ([]byte, string,
 		URL:           "",
 	}
 	return file.Encrypt(data), "application/octet-stream", file
-
 }
 
-func (portal *Portal) HandleMediaMessage(source *User, download func() ([]byte, error), thumbnail []byte, info whatsapp.MessageInfo, context whatsapp.ContextInfo, mimeType, caption string, length uint32, sendAsSticker bool) {
-	intent := portal.startHandling(source, info)
+func (portal *Portal) tryKickUser(userID id.UserID, intent *appservice.IntentAPI) error {
+	_, err := intent.KickUser(portal.MXID, &mautrix.ReqKickUser{UserID: userID})
+	if err != nil {
+		httpErr, ok := err.(mautrix.HTTPError)
+		if ok && httpErr.RespError != nil && httpErr.RespError.ErrCode == "M_FORBIDDEN" {
+			_, err = portal.MainIntent().KickUser(portal.MXID, &mautrix.ReqKickUser{UserID: userID})
+		}
+	}
+	return err
+}
+
+func (portal *Portal) removeUser(isSameUser bool, kicker *appservice.IntentAPI, target id.UserID, targetIntent *appservice.IntentAPI) {
+	if !isSameUser || targetIntent == nil {
+		err := portal.tryKickUser(target, kicker)
+		if err != nil {
+			portal.log.Warnfln("Failed to kick %s from %s: %v", target, portal.MXID, err)
+			if targetIntent != nil {
+				_, _ = targetIntent.LeaveRoom(portal.MXID)
+			}
+		}
+	} else {
+		_, err := targetIntent.LeaveRoom(portal.MXID)
+		if err != nil {
+			portal.log.Warnfln("Failed to leave portal as %s: %v", target, err)
+			_, _ = portal.MainIntent().KickUser(portal.MXID, &mautrix.ReqKickUser{UserID: target})
+		}
+	}
+}
+
+func (portal *Portal) HandleWhatsAppKick(senderJID string, jids []string) {
+	sender := portal.bridge.GetPuppetByJID(senderJID)
+	senderIntent := sender.IntentFor(portal)
+	for _, jid := range jids {
+		puppet := portal.bridge.GetPuppetByJID(jid)
+		portal.removeUser(puppet.JID == sender.JID, senderIntent, puppet.MXID, puppet.DefaultIntent())
+
+		user := portal.bridge.GetUserByJID(jid)
+		if user != nil {
+			var customIntent *appservice.IntentAPI
+			if puppet.CustomMXID == user.MXID {
+				customIntent = puppet.CustomIntent()
+			}
+			portal.removeUser(puppet.JID == sender.JID, senderIntent, user.MXID, customIntent)
+		}
+	}
+}
+
+func (portal *Portal) HandleWhatsAppInvite(senderJID string, jids []string) {
+	senderIntent := portal.MainIntent()
+	if senderJID != "unknown" {
+		sender := portal.bridge.GetPuppetByJID(senderJID)
+		senderIntent = sender.IntentFor(portal)
+	}
+	for _, jid := range jids {
+		puppet := portal.bridge.GetPuppetByJID(jid)
+		_, err := senderIntent.InviteUser(portal.MXID, &mautrix.ReqInviteUser{UserID: puppet.MXID})
+		if err != nil {
+			portal.log.Warnfln("Failed to invite %s as %s: %v", puppet.MXID, senderIntent.UserID, err)
+		}
+		err = puppet.DefaultIntent().EnsureJoined(portal.MXID)
+		if err != nil {
+			portal.log.Errorfln("Failed to ensure %s is joined: %v", puppet.MXID, err)
+		}
+	}
+}
+
+type base struct {
+	download func() ([]byte, error)
+	info     whatsapp.MessageInfo
+	context  whatsapp.ContextInfo
+	mimeType string
+}
+
+type mediaMessage struct {
+	base
+
+	thumbnail     []byte
+	caption       string
+	fileName      string
+	length        uint32
+	sendAsSticker bool
+}
+
+func (portal *Portal) HandleMediaMessage(source *User, msg mediaMessage) {
+	intent := portal.startHandling(source, msg.info)
 	if intent == nil {
 		return
 	}
 
-	data, err := download()
+	data, err := msg.download()
 	if err == whatsapp.ErrMediaDownloadFailedWith404 || err == whatsapp.ErrMediaDownloadFailedWith410 {
-		portal.log.Warnfln("Failed to download media for %s: %v. Calling LoadMediaInfo and retrying download...", info.Id, err)
-		_, err = source.Conn.LoadMediaInfo(info.RemoteJid, info.Id, info.FromMe)
+		portal.log.Warnfln("Failed to download media for %s: %v. Calling LoadMediaInfo and retrying download...", msg.info.Id, err)
+		_, err = source.Conn.LoadMediaInfo(msg.info.RemoteJid, msg.info.Id, msg.info.FromMe)
 		if err != nil {
-			portal.sendMediaBridgeFailure(source, intent, info, errors.Wrap(err, "failed to load media info"))
+			portal.sendMediaBridgeFailure(source, intent, msg.info, errors.Wrap(err, "failed to load media info"))
 			return
 		}
-		data, err = download()
+		data, err = msg.download()
 	}
 	if err == whatsapp.ErrNoURLPresent {
-		portal.log.Debugfln("No URL present error for media message %s, ignoring...", info.Id)
+		portal.log.Debugfln("No URL present error for media message %s, ignoring...", msg.info.Id)
 		return
 	} else if err != nil {
-		portal.sendMediaBridgeFailure(source, intent, info, err)
+		portal.sendMediaBridgeFailure(source, intent, msg.info, err)
 		return
 	}
 
 	// synapse doesn't handle webp well, so we convert it. This can be dropped once https://github.com/matrix-org/synapse/issues/4382 is fixed
-	if mimeType == "image/webp" {
+	if msg.mimeType == "image/webp" {
 		img, err := decodeWebp(bytes.NewReader(data))
 		if err != nil {
 			portal.log.Errorfln("Failed to decode media for %s: %v", err)
@@ -1292,16 +1403,16 @@ func (portal *Portal) HandleMediaMessage(source *User, download func() ([]byte, 
 			return
 		}
 		data = buf.Bytes()
-		mimeType = "image/png"
+		msg.mimeType = "image/png"
 	}
 
 	var width, height int
-	if strings.HasPrefix(mimeType, "image/") {
+	if strings.HasPrefix(msg.mimeType, "image/") {
 		cfg, _, _ := image.DecodeConfig(bytes.NewReader(data))
 		width, height = cfg.Width, cfg.Height
 	}
 
-	data, uploadMimeType, file := portal.encryptFile(data, mimeType)
+	data, uploadMimeType, file := portal.encryptFile(data, msg.mimeType)
 
 	uploaded, err := intent.UploadBytes(data, uploadMimeType)
 	if err != nil {
@@ -1309,21 +1420,24 @@ func (portal *Portal) HandleMediaMessage(source *User, download func() ([]byte, 
 		return
 	}
 
-	fileName := info.Id
-	exts, _ := mime.ExtensionsByType(mimeType)
-	if exts != nil && len(exts) > 0 {
-		fileName += exts[0]
+	if msg.fileName == "" {
+		msg.fileName = msg.info.Id
+
+		exts, _ := mime.ExtensionsByType(msg.mimeType)
+		if exts != nil && len(exts) > 0 {
+			msg.fileName += exts[0]
+		}
 	}
 
 	content := &event.MessageEventContent{
-		Body: fileName,
+		Body: msg.fileName,
 		File: file,
 		Info: &event.FileInfo{
 			Size:     len(data),
-			MimeType: mimeType,
+			MimeType: msg.mimeType,
 			Width:    width,
 			Height:   height,
-			Duration: int(length),
+			Duration: int(msg.length),
 		},
 	}
 	if content.File != nil {
@@ -1331,16 +1445,16 @@ func (portal *Portal) HandleMediaMessage(source *User, download func() ([]byte, 
 	} else {
 		content.URL = uploaded.ContentURI.CUString()
 	}
-	portal.SetReply(content, context)
+	portal.SetReply(content, msg.context)
 
-	if thumbnail != nil && portal.bridge.Config.Bridge.WhatsappThumbnail {
-		thumbnailMime := http.DetectContentType(thumbnail)
-		thumbnailCfg, _, _ := image.DecodeConfig(bytes.NewReader(thumbnail))
-		thumbnailSize := len(thumbnail)
-		thumbnail, thumbnailUploadMime, thumbnailFile := portal.encryptFile(thumbnail, thumbnailMime)
+	if msg.thumbnail != nil && portal.bridge.Config.Bridge.WhatsappThumbnail {
+		thumbnailMime := http.DetectContentType(msg.thumbnail)
+		thumbnailCfg, _, _ := image.DecodeConfig(bytes.NewReader(msg.thumbnail))
+		thumbnailSize := len(msg.thumbnail)
+		thumbnail, thumbnailUploadMime, thumbnailFile := portal.encryptFile(msg.thumbnail, thumbnailMime)
 		uploadedThumbnail, err := intent.UploadBytes(thumbnail, thumbnailUploadMime)
 		if err != nil {
-			portal.log.Warnfln("Failed to upload thumbnail for %s: %v", info.Id, err)
+			portal.log.Warnfln("Failed to upload thumbnail for %s: %v", msg.info.Id, err)
 		} else if uploadedThumbnail != nil {
 			if thumbnailFile != nil {
 				thumbnailFile.URL = uploadedThumbnail.ContentURI.CUString()
@@ -1357,9 +1471,9 @@ func (portal *Portal) HandleMediaMessage(source *User, download func() ([]byte, 
 		}
 	}
 
-	switch strings.ToLower(strings.Split(mimeType, "/")[0]) {
+	switch strings.ToLower(strings.Split(msg.mimeType, "/")[0]) {
 	case "image":
-		if !sendAsSticker {
+		if !msg.sendAsSticker {
 			content.MsgType = event.MsgImage
 		}
 	case "video":
@@ -1371,20 +1485,20 @@ func (portal *Portal) HandleMediaMessage(source *User, download func() ([]byte, 
 	}
 
 	_, _ = intent.UserTyping(portal.MXID, false, 0)
-	ts := int64(info.Timestamp * 1000)
+	ts := int64(msg.info.Timestamp * 1000)
 	eventType := event.EventMessage
-	if sendAsSticker {
+	if msg.sendAsSticker {
 		eventType = event.EventSticker
 	}
 	resp, err := portal.sendMessage(intent, eventType, content, ts)
 	if err != nil {
-		portal.log.Errorfln("Failed to handle message %s: %v", info.Id, err)
+		portal.log.Errorfln("Failed to handle message %s: %v", msg.info.Id, err)
 		return
 	}
 
-	if len(caption) > 0 {
+	if len(msg.caption) > 0 {
 		captionContent := &event.MessageEventContent{
-			Body:    caption,
+			Body:    msg.caption,
 			MsgType: event.MsgNotice,
 		}
 
@@ -1392,12 +1506,12 @@ func (portal *Portal) HandleMediaMessage(source *User, download func() ([]byte, 
 
 		_, err := portal.sendMessage(intent, event.EventMessage, captionContent, ts)
 		if err != nil {
-			portal.log.Warnfln("Failed to handle caption of message %s: %v", info.Id, err)
+			portal.log.Warnfln("Failed to handle caption of message %s: %v", msg.info.Id, err)
 		}
 		// TODO store caption mxid?
 	}
 
-	portal.finishHandling(source, info.Source, resp.EventID)
+	portal.finishHandling(source, msg.info.Source, resp.EventID)
 }
 
 func makeMessageID() *string {
@@ -1443,6 +1557,53 @@ func (portal *Portal) downloadThumbnail(content *event.MessageEventContent, id i
 	return buf.Bytes()
 }
 
+func (portal *Portal) convertGifToVideo(gif []byte) ([]byte, error) {
+	dir, err := ioutil.TempDir("", "gif-convert-*")
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to make temp dir")
+	}
+	defer os.RemoveAll(dir)
+
+	inputFile, err := os.OpenFile(filepath.Join(dir, "input.gif"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed open input file")
+	}
+	_, err = inputFile.Write(gif)
+	if err != nil {
+		_ = inputFile.Close()
+		return nil, errors.Wrap(err, "failed to write gif to input file")
+	}
+	_ = inputFile.Close()
+
+	outputFileName := filepath.Join(dir, "output.mp4")
+	cmd := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "warning",
+		"-f", "gif", "-i", inputFile.Name(),
+		"-pix_fmt", "yuv420p", "-c:v", "libx264", "-movflags", "+faststart",
+		"-filter:v", "crop='floor(in_w/2)*2:floor(in_h/2)*2'",
+		outputFileName)
+	vcLog := portal.log.Sub("VideoConverter").WithDefaultLevel(log.LevelWarn)
+	cmd.Stdout = vcLog
+	cmd.Stderr = vcLog
+
+	err = cmd.Run()
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to run ffmpeg")
+	}
+	outputFile, err := os.OpenFile(filepath.Join(dir, "output.mp4"), os.O_RDONLY, 0)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to open output file")
+	}
+	defer func() {
+		_ = outputFile.Close()
+		_ = os.Remove(outputFile.Name())
+	}()
+	mp4, err := ioutil.ReadAll(outputFile)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to read mp4 from output file")
+	}
+	return mp4, nil
+}
+
 func (portal *Portal) preprocessMatrixMedia(sender *User, relaybotFormatted bool, content *event.MessageEventContent, eventID id.EventID, mediaType whatsapp.MediaType) *MediaUpload {
 	var caption string
 	if relaybotFormatted {
@@ -1471,6 +1632,14 @@ func (portal *Portal) preprocessMatrixMedia(sender *User, relaybotFormatted bool
 			portal.log.Errorfln("Failed to decrypt media in %s: %v", eventID, err)
 			return nil
 		}
+	}
+	if mediaType == whatsapp.MediaVideo && content.GetInfo().MimeType == "image/gif" {
+		data, err = portal.convertGifToVideo(data)
+		if err != nil {
+			portal.log.Errorfln("Failed to convert gif to mp4 in %s: %v", eventID, err)
+			return nil
+		}
+		content.Info.MimeType = "video/mp4"
 	}
 
 	url, mediaKey, fileEncSHA256, fileSHA256, fileLength, err := sender.Conn.Upload(bytes.NewReader(data), mediaType)
@@ -1590,6 +1759,8 @@ func (portal *Portal) convertMatrixMessage(sender *User, evt *event.Event) (*waP
 	}
 	if evt.Type == event.EventSticker {
 		content.MsgType = event.MsgImage
+	} else if content.MsgType == event.MsgImage && content.GetInfo().MimeType == "image/gif" {
+		content.MsgType = event.MsgVideo
 	}
 
 	switch content.MsgType {
@@ -1629,6 +1800,7 @@ func (portal *Portal) convertMatrixMessage(sender *User, evt *event.Event) (*waP
 			FileLength:    &media.FileLength,
 		}
 	case event.MsgVideo:
+		gifPlayback := content.GetInfo().MimeType == "image/gif"
 		media := portal.preprocessMatrixMedia(sender, relaybotFormatted, content, evt.ID, whatsapp.MediaVideo)
 		if media == nil {
 			return nil, sender
@@ -1640,6 +1812,7 @@ func (portal *Portal) convertMatrixMessage(sender *User, evt *event.Event) (*waP
 			Url:           &media.URL,
 			MediaKey:      media.MediaKey,
 			Mimetype:      &content.GetInfo().MimeType,
+			GifPlayback:   &gifPlayback,
 			Seconds:       &duration,
 			FileEncSha256: media.FileEncSHA256,
 			FileSha256:    media.FileSHA256,
@@ -1822,6 +1995,35 @@ func (portal *Portal) Delete() {
 	portal.bridge.portalsLock.Unlock()
 }
 
+func (portal *Portal) GetMatrixUsers() ([]id.UserID, error) {
+	members, err := portal.MainIntent().JoinedMembers(portal.MXID)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get member list")
+	}
+	var users []id.UserID
+	for userID := range members.Joined {
+		_, isPuppet := portal.bridge.ParsePuppetMXID(userID)
+		if !isPuppet && userID != portal.bridge.Bot.UserID {
+			users = append(users, userID)
+		}
+	}
+	return users, nil
+}
+
+func (portal *Portal) CleanupIfEmpty() {
+	users, err := portal.GetMatrixUsers()
+	if err != nil {
+		portal.log.Errorfln("Failed to get Matrix user list to determine if portal needs to be cleaned up: %v", err)
+		return
+	}
+
+	if len(users) == 0 {
+		portal.log.Infoln("Room seems to be empty, cleaning up...")
+		portal.Delete()
+		portal.Cleanup(false)
+	}
+}
+
 func (portal *Portal) Cleanup(puppetsOnly bool) {
 	if len(portal.MXID) == 0 {
 		return
@@ -1868,9 +2070,38 @@ func (portal *Portal) HandleMatrixLeave(sender *User) {
 		portal.Delete()
 		portal.Cleanup(false)
 		return
+	} else {
+		// TODO should we somehow deduplicate this call if this leave was sent by the bridge?
+		resp, err := sender.Conn.LeaveGroup(portal.Key.JID)
+		if err != nil {
+			portal.log.Errorfln("Failed to leave group as %s: %v", sender.MXID, err)
+			return
+		}
+		portal.log.Infoln("Leave response:", <-resp)
+		portal.CleanupIfEmpty()
 	}
 }
 
-func (portal *Portal) HandleMatrixKick(sender *User, event *event.Event) {
-	// TODO
+func (portal *Portal) HandleMatrixKick(sender *User, evt *event.Event) {
+	puppet := portal.bridge.GetPuppetByMXID(id.UserID(evt.GetStateKey()))
+	if puppet != nil {
+		resp, err := sender.Conn.RemoveMember(portal.Key.JID, []string{puppet.JID})
+		if err != nil {
+			portal.log.Errorfln("Failed to kick %s from group as %s: %v", puppet.JID, sender.MXID, err)
+			return
+		}
+		portal.log.Infoln("Kick %s response: %s", puppet.JID, <-resp)
+	}
+}
+
+func (portal *Portal) HandleMatrixInvite(sender *User, evt *event.Event) {
+	puppet := portal.bridge.GetPuppetByMXID(id.UserID(evt.GetStateKey()))
+	if puppet != nil {
+		resp, err := sender.Conn.AddMember(portal.Key.JID, []string{puppet.JID})
+		if err != nil {
+			portal.log.Errorfln("Failed to add %s to group as %s: %v", puppet.JID, sender.MXID, err)
+			return
+		}
+		portal.log.Infoln("Add %s response: %s", puppet.JID, <-resp)
+	}
 }
