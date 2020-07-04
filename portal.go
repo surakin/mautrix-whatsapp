@@ -823,7 +823,7 @@ func (portal *Portal) handleHistory(user *User, messages []interface{}) {
 
 type BridgeInfoSection struct {
 	ID          string              `json:"id"`
-	DisplayName string              `json:"display_name,omitempty"`
+	DisplayName string              `json:"displayname,omitempty"`
 	AvatarURL   id.ContentURIString `json:"avatar_url,omitempty"`
 	ExternalURL string              `json:"external_url,omitempty"`
 }
@@ -1049,6 +1049,16 @@ func (portal *Portal) SetReply(content *event.MessageEventContent, info whatsapp
 			portal.log.Warnln("Failed to get reply target:", err)
 			return
 		}
+		if evt.Type == event.EventEncrypted {
+			_ = evt.Content.ParseRaw(evt.Type)
+			decryptedEvt, err := portal.bridge.Crypto.Decrypt(evt)
+			if err != nil {
+				portal.log.Warnln("Failed to decrypt reply target:", err)
+			} else {
+				evt = decryptedEvt
+			}
+		}
+		_ = evt.Content.ParseRaw(evt.Type)
 		content.SetReply(evt)
 	}
 	return
