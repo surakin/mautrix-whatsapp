@@ -129,7 +129,9 @@ func (handler *CommandHandler) CommandMux(ce *CommandEvent) {
 		handler.CommandSetPowerLevel(ce)
 	case "logout":
 		handler.CommandLogout(ce)
-	case "login-matrix", "sync", "list", "open", "pm", "invite-link", "join":
+	case "toggle-presence":
+		handler.CommandPresence(ce)
+	case "login-matrix", "sync", "list", "open", "pm", "invite-link", "join", "create":
 		if !ce.User.HasSession() {
 			ce.Reply("You are not logged in. Use the `login` command to log into WhatsApp.")
 			return
@@ -153,6 +155,8 @@ func (handler *CommandHandler) CommandMux(ce *CommandEvent) {
 			handler.CommandInviteLink(ce)
 		case "join":
 			handler.CommandJoin(ce)
+		case "create":
+			handler.CommandCreate(ce)
 		}
 	default:
 		ce.Reply("Unknown Command")
@@ -247,6 +251,75 @@ func (handler *CommandHandler) CommandJoin(ce *CommandEvent) {
 	}
 }
 
+const cmdCreateHelp = `create - Create a group chat.`
+
+func (handler *CommandHandler) CommandCreate(ce *CommandEvent) {
+	if ce.Portal != nil {
+		ce.Reply("This is already a portal room")
+		return
+	}
+
+	members, err := ce.Bot.JoinedMembers(ce.RoomID)
+	if err != nil {
+		ce.Reply("Failed to get room members: %v", err)
+		return
+	}
+
+	var roomNameEvent event.RoomNameEventContent
+	err = ce.Bot.StateEvent(ce.RoomID, event.StateRoomName, "", &roomNameEvent)
+	if err != nil {
+		ce.Reply("Failed to get room name")
+		return
+	} else if len(roomNameEvent.Name) == 0 {
+		ce.Reply("Please set a name for the room first")
+		return
+	}
+
+	var encryptionEvent event.EncryptionEventContent
+	err = ce.Bot.StateEvent(ce.RoomID, event.StateEncryption, "", &encryptionEvent)
+	if err != nil {
+		ce.Reply("Failed to get room encryption status")
+		return
+	}
+
+	participants := []string{ce.User.JID}
+	for userID := range members.Joined {
+		jid, ok := handler.bridge.ParsePuppetMXID(userID)
+		if ok && jid != ce.User.JID {
+			participants = append(participants, jid)
+		}
+	}
+
+	resp, err := ce.User.Conn.CreateGroup(roomNameEvent.Name, participants)
+	if err != nil {
+		ce.Reply("Failed to create group: %v", err)
+		return
+	}
+	portal := handler.bridge.GetPortalByJID(database.GroupPortalKey(resp.GroupID))
+	portal.roomCreateLock.Lock()
+	defer portal.roomCreateLock.Unlock()
+	if len(portal.MXID) != 0 {
+		portal.log.Warnln("Detected race condition in room creation")
+		// TODO race condition, clean up the old room
+	}
+	portal.MXID = ce.RoomID
+	portal.Name = roomNameEvent.Name
+	portal.Encrypted = encryptionEvent.Algorithm == id.AlgorithmMegolmV1
+	if !portal.Encrypted && handler.bridge.Config.Bridge.Encryption.Default {
+		_, err = portal.MainIntent().SendStateEvent(portal.MXID, event.StateEncryption, "", &event.EncryptionEventContent{Algorithm: id.AlgorithmMegolmV1})
+		if err != nil {
+			portal.log.Warnln("Failed to enable e2be:", err)
+		}
+		portal.Encrypted = true
+	}
+
+	portal.Update()
+	portal.UpdateBridgeInfo()
+
+	ce.Reply("Successfully created WhatsApp group %s", portal.Key.JID)
+	ce.User.addPortalToCommunity(portal)
+}
+
 const cmdSetPowerLevelHelp = `set-pl [user ID] <power level> - Change the power level in a portal room. Only for bridge admins.`
 
 func (handler *CommandHandler) CommandSetPowerLevel(ce *CommandEvent) {
@@ -333,6 +406,36 @@ func (handler *CommandHandler) CommandLogout(ce *CommandEvent) {
 	//ce.User.JID = ""
 	ce.User.SetSession(nil)
 	ce.Reply("Logged out successfully.")
+}
+
+const cmdPresenceHelp = `toggle-presence - Toggle bridging of presence and read receipts`
+
+func (handler *CommandHandler) CommandPresence(ce *CommandEvent) {
+	if ce.User.Session == nil {
+		ce.Reply("You're not logged in.")
+		return
+	}
+	customPuppet := handler.bridge.GetPuppetByCustomMXID(ce.User.MXID)
+	if customPuppet == nil {
+		ce.Reply("You're not logged in with your Matrix account.")
+		return
+	}
+	customPuppet.EnablePresence = !customPuppet.EnablePresence
+	customPuppet.Update()
+	var newPresence whatsapp.Presence
+	if customPuppet.EnablePresence {
+		newPresence = whatsapp.PresenceAvailable
+		ce.Reply("Enabled presence and read receipt bridging")
+	} else {
+		newPresence = whatsapp.PresenceUnavailable
+		ce.Reply("Disabled presence and read receipt bridging")
+	}
+	if ce.User.IsConnected() {
+		_, err := ce.User.Conn.Presence("", newPresence)
+		if err != nil {
+			ce.User.log.Warnln("Failed to set presence:", err)
+		}
+	}
 }
 
 const cmdDeleteSessionHelp = `delete-session - Delete session information and disconnect from WhatsApp without sending a logout request`
@@ -501,12 +604,14 @@ func (handler *CommandHandler) CommandHelp(ce *CommandEvent) {
 		cmdPrefix + cmdPingHelp,
 		cmdPrefix + cmdLoginMatrixHelp,
 		cmdPrefix + cmdLogoutMatrixHelp,
+		cmdPrefix + cmdPresenceHelp,
 		cmdPrefix + cmdSyncHelp,
 		cmdPrefix + cmdListHelp,
 		cmdPrefix + cmdOpenHelp,
 		cmdPrefix + cmdPMHelp,
 		cmdPrefix + cmdInviteLinkHelp,
 		cmdPrefix + cmdJoinHelp,
+		cmdPrefix + cmdCreateHelp,
 		cmdPrefix + cmdSetPowerLevelHelp,
 		cmdPrefix + cmdDeletePortalHelp,
 		cmdPrefix + cmdDeleteAllPortalsHelp,
